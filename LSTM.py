@@ -29,13 +29,17 @@ def calculate_angle(a, b, c):
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
 
-# Feature 추출 함수
+# Feature 추출 함수 (visibility 필터 적용)
 def extract_features(keypoints):
     features = []
     for group in GROUPS:
         a = keypoints[group[0]]
         b = keypoints[group[1]]
         c = keypoints[group[2]]
+
+        # visibility 필터링
+        if a[2] < 0.2 or b[2] < 0.2 or c[2] < 0.2:
+            return None  # 해당 프레임 제외
 
         angle = calculate_angle(a[:2], b[:2], c[:2])
         confidence = (a[2] + b[2] + c[2]) / 3
@@ -46,7 +50,7 @@ def extract_features(keypoints):
 
 # 커스텀 Dataset
 class PoseSequenceDataset(Dataset):
-    def __init__(self, json_folder, sequence_length=30):
+    def __init__(self, json_folder, sequence_length=15):
         self.data = []
         self.labels = []
         self.sequence_length = sequence_length
@@ -66,9 +70,10 @@ class PoseSequenceDataset(Dataset):
                 if isinstance(persons, list) and persons:
                     keypoints = persons[0]['keypoints']
                     features = extract_features(keypoints)
-                    features_seq.append(features)
+                    if features is not None:
+                        features_seq.append(features)
 
-            label = 0  # 기본값
+            label = 0
             for frame in frames:
                 persons = annotation[frame]
                 if isinstance(persons, list) and persons:
@@ -85,11 +90,11 @@ class PoseSequenceDataset(Dataset):
     def __getitem__(self, idx):
         return torch.tensor(self.data[idx], dtype=torch.float32), torch.tensor(self.labels[idx], dtype=torch.float32)
 
-# LSTM 모델
+# LSTM 모델 with Dropout
 class FightLSTM(nn.Module):
-    def __init__(self, input_size=16, hidden_size=64, num_layers=2):
+    def __init__(self, input_size=16, hidden_size=64, num_layers=2, dropout=0.5):
         super(FightLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
         self.sigmoid = nn.Sigmoid()
 
@@ -100,12 +105,15 @@ class FightLSTM(nn.Module):
         out = self.sigmoid(out)
         return out.squeeze()
 
-# 학습 함수
-def train(model, train_loader, val_loader, epochs=1000, lr=1e-4):
+# 학습 함수 (Early Stopping, Best Model 저장 포함)
+def train(model, train_loader, val_loader, epochs=1000, lr=1e-4, patience=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    best_val_loss = float('inf')
+    early_stop_counter = 0
 
     train_losses = []
     val_losses = []
@@ -164,20 +172,32 @@ def train(model, train_loader, val_loader, epochs=1000, lr=1e-4):
             "Val Acc": f"{val_accuracy:.4f}"
         })
 
+        # Best model 저장
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            early_stop_counter = 0
+            torch.save(model.state_dict(), 'model/best_model.pth')
+        else:
+            early_stop_counter += 1
+
+        if early_stop_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
     # 학습 완료 후 그래프 저장
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
-    plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
-    plt.plot(range(1, epochs+1), val_losses, label='Validation Loss')
+    plt.plot(range(1, len(train_losses)+1), train_losses, label='Train Loss')
+    plt.plot(range(1, len(val_losses)+1), val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Loss Curve')
     plt.legend()
 
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, epochs+1), train_accuracies, label='Train Accuracy')
-    plt.plot(range(1, epochs+1), val_accuracies, label='Validation Accuracy')
+    plt.plot(range(1, len(train_accuracies)+1), train_accuracies, label='Train Accuracy')
+    plt.plot(range(1, len(val_accuracies)+1), val_accuracies, label='Validation Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.title('Accuracy Curve')
@@ -199,4 +219,4 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
     model = FightLSTM()
-    train(model, train_loader, val_loader)
+    train(model, train_loader, val_loader, epochs=1000, lr=1e-4, patience=50)
